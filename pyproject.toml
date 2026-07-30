@@ -1,0 +1,16 @@
+[project]
+name = "moeprune"
+version = "0.1.0"
+description = "Training-free domain pruning and recombination of experts in Mixture-of-Experts LLMs"
+requires-python = ">=3.10"
+dependencies = ["numpy", "torch"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

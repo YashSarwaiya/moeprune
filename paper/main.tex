@@ -1,0 +1,379 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+\emergencystretch=3em
+
+\title{\textbf{Carve, Then Compose: Training-Free Domain Pruning and\\
+Recombination of Experts in Mixture-of-Experts LLMs}}
+
+\author{Yash Sarwaiya\\
+\small Independent Researcher\\
+\small \texttt{yashsarwaiyaa@gmail.com}}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Expert pruning of Mixture-of-Experts (MoE) language models is believed to be
+safe only up to roughly 25\% without retraining. We show that this ceiling is
+an artifact of demanding \emph{general} capability, and that when only one
+domain must survive, an off-the-shelf fine-grained MoE tolerates far deeper
+cuts. On Qwen3-30B-A3B (128 experts/layer, top-8), a norm-aware contribution
+score computed from a teacher-forced prefill over only ${\sim}30$ domain
+demonstrations retains 97\% of baseline HumanEval pass@1 with 50\% of routed
+experts removed, and 90\% with 65\% removed---while GSM8K collapses from
+99.3\% to 33.3\%, confirming genuinely domain-targeted compression. A
+size-matched random control scores 26.8\% HumanEval at the 50\% ratio, an
+advantage of 62 points for informed selection. We further show that
+domain-pruned variants \emph{compose}: the per-layer union of independently
+derived coding and math expert sets (52\% of experts) scores within 1--2
+points of the full model on both HumanEval (90.9\%) and GSM8K (97.3\%), while
+dropping 34 points on a non-STEM MMLU probe---a two-skill specialist
+assembled post hoc with no retraining. Composition holds for distant domain
+pairs (code$\cup$humanities: 84.1\% HumanEval, 74.3\% MMLU-humanities), whose
+keep-sets overlap less than sibling pairs. Finally, we observe a sharp
+asymmetry: procedural domains (coding, math) prune cleanly, but a knowledge
+domain (humanities) does not---the humanities-only specialist collapses even
+on its own domain (28.7\% vs.\ 84.7\% baseline), yet unions restore it to
+74.3\%. Our results suggest fine-grained MoE models are post-hoc composable at
+the expert level, and motivate applying the recipe to the most fine-grained
+public MoE, Kimi K3 (896 experts/layer).
+\end{abstract}
+
+\section{Introduction}
+
+Sparse Mixture-of-Experts architectures dominate the largest open language
+models, but their checkpoints are monolithic: a user who needs only coding
+ability must nevertheless store and serve every expert, including those that
+exist to support poetry, law, and the long tail of world knowledge. One-shot
+expert pruning offers relief, but published results converge on a ceiling near
+25\% of experts before general performance degrades \cite{heapr,mone,moei2},
+with ${\sim}50\%$ reachable only with retraining or distillation
+\cite{moepruner}.
+
+We ask a different question: \textbf{how much of the expert pool is needed if
+the user cares about a single domain?} This reframing removes the constraint
+that produced the 25\% ceiling---capability outside the target domain is
+deliberately sacrificed rather than preserved. Building on few-shot expert
+localization \cite{easyep}, we prune an off-the-shelf fine-grained MoE with a
+simple training-free pipeline and measure the full quality-versus-ratio curve,
+with controls the one-shot pruning literature typically omits.
+
+Our contributions:
+
+\begin{enumerate}
+\item \textbf{A domain-restricted pruning curve far above the general
+ceiling.} With a norm-aware contribution score over ${\sim}30$ demonstrations
+plus protection of ``super experts'' identified on a general set, coding
+capability survives 50\% expert removal at 89.0\% HumanEval pass@1 (baseline
+91.5\%) and 65\% removal at 82.3\%. The curve holds a plateau to its knee at
+${\sim}65\%$, decays steadily to 80\% (45.1\%), and collapses by 87.5\%.
+
+\item \textbf{Matched random controls quantifying the value of selection.} At
+identical keep-set sizes, random expert selection scores 26.8\% vs.\ 89.0\%
+(50\% ratio) and 0.6\% vs.\ 82.3\% (65\% ratio). Informed selection---not
+redundancy---carries the result.
+
+\item \textbf{Training-free composition of domain specialists.} The per-layer
+union of independently derived coding and math keep-sets (67/128 experts, 75\%
+of the sum of the parts) scores 90.9\% HumanEval and 97.3\% GSM8K---above both
+specialists and within 2 points of the unpruned model---while a non-STEM MMLU
+probe confirms it remains a specialist (50.3\% vs.\ 84.7\% baseline). A distant
+pair (code$\cup$humanities) also composes.
+
+\item \textbf{A skills/knowledge asymmetry.} Identical machinery that yields
+strong coding and math specialists fails to produce a humanities specialist
+(28.7\% on MMLU-humanities vs.\ 84.7\% baseline), consistent with reports that
+semantic knowledge is distributed while procedural skill is localized
+\cite{whatgets,illusion}. Unions partially restore the lost capability
+(74.3\%), indicating the deficit is complementary rather than absolute.
+\end{enumerate}
+
+All experiments are one-shot (no gradient updates), run on a single NVIDIA
+B200 GPU, and use masking that is exactly output-equivalent to checkpoint
+surgery (Section~\ref{sec:mask}), making the study reproducible at minimal
+cost.
+
+\section{Related Work}
+
+\paragraph{General expert pruning.} HEAPr \cite{heapr} and MoNE \cite{mone}
+achieve near-lossless one-shot pruning at 20--25\% on DeepSeek/Qwen MoE
+families; MoNE reports ${\sim}24$--25\% as the maximum within 1\% loss for
+Qwen3-30B-A3B---the same base model we use, providing a direct published
+anchor. MoE-I$^2$ \cite{moei2} and MoE-Pruner \cite{moepruner} reach
+${\sim}50\%$ only with intra-expert decomposition, fine-tuning, or expert-wise
+distillation. Scoring criteria for one-shot pruning are surveyed in
+\cite{scoring}; AIMER \cite{aimer} removes calibration dependence in the
+task-agnostic setting. Our setting differs: we do not preserve general
+capability.
+
+\paragraph{Domain-specific pruning.} EASY-EP \cite{easyep} introduced few-shot
+expert localization with output-aware importance, which our contribution score
+follows in spirit. C-PRUNE \cite{cprune} clusters experts for task-specific
+compression in the biomedical domain, and recent work reports coding-domain
+pruning at ${\sim}50\%$ on earlier-generation MoEs \cite{halfexperts}. Relative
+to this line we contribute (i)~the full quality-vs-ratio curve with its knee,
+(ii)~matched random controls, and (iii)~the composition results, none of which
+appear in prior domain-pruning studies to our knowledge.
+
+\paragraph{Expert merging and modularity.} An alternative to deletion is
+merging similar experts \cite{hcsmoe,reap}; REAP \cite{reap} finds pruning
+superior for one-shot compression. EMO \cite{emo} pretrains MoEs so that
+task-specific expert subsets can be selected at deployment, arguing that
+standard MoEs specialize syntactically rather than semantically. Our results
+provide a counterpoint: a standard, conventionally trained MoE already supports
+post-hoc subset selection and recombination for procedural domains with no
+pretraining modification---though EMO-style training may be what closes the gap
+we observe on knowledge domains. Analyses of expert specialization
+\cite{whatgets,illusion,doexist} motivate our protection of disproportionately
+active super experts.
+
+\section{Method}
+
+Given a routed-MoE checkpoint with $E$ experts per layer and top-$k$ routing,
+the pipeline has four training-free stages.
+
+\subsection{Routing capture}
+We run a teacher-forced prefill (no generation) over a small calibration set;
+each item is a prompt concatenated with a reference solution. Hooks on each
+layer's router record, per token, the top-$k$ expert indices and their
+renormalized gate weights, and per expert the $L_2$ norm of its output. Only
+dense per-(layer, expert) accumulators are stored.
+
+\subsection{Norm-aware contribution scoring}
+Routing frequency conflates syntactic regularity with importance, so we score
+expert $e$ in layer $l$ as the accumulated gate-weighted output norm
+\begin{equation}
+\mathrm{score}(l,e) \;=\; \sum_{t} g_{l,e}(x_t)\,\bigl\lVert f_{l,e}(x_t)
+\bigr\rVert_2 ,
+\end{equation}
+over the domain calibration set---the contribution the expert actually adds to
+the residual stream, following output-aware importance \cite{easyep}.
+
+\subsection{Super-expert protection}
+A small set of experts does disproportionate work regardless of domain
+\cite{illusion}. On a \emph{general} calibration set we flag experts whose gate
+mass exceeds $8\times$ the layer median, or that fall in the top 2\% of a
+layer's mass, and include them in every keep-set (6.5 experts/layer for our
+model). Domain pruning must not delete generic infrastructure.
+
+\subsection{Pruning, masking, and composition}
+\label{sec:mask}
+A \emph{manifest} lists surviving experts per layer: the protected set plus the
+top domain-scored experts up to the target ratio, with a floor of $2k$ experts
+per layer. For evaluation we \emph{mask} rather than rewrite: a hook sets
+pruned experts' router logits to $-\infty$, which is exactly output-equivalent
+to deleting the expert tensors and slicing the router (verified to
+$<10^{-5}$ relative error on a synthetic model with planted structure). Masking
+makes a sweep cost zero storage; deployment uses real checkpoint surgery with
+identical outputs.
+
+\textbf{Composition} is the per-layer set union of two manifests. No scores are
+recomputed and no calibration is rerun; the union inherits both protected sets.
+
+\section{Experimental Setup}
+
+\paragraph{Model.} Qwen3-30B-A3B-Instruct-2507: 48 layers, 128 routed experts
+per layer, top-8 routing with renormalization, bf16, evaluated on one NVIDIA
+B200 with greedy decoding throughout.
+
+\paragraph{Calibration sets.} Authored for this study; no benchmark items are
+reused. Coding: 30 prompt-and-solution items across eight languages
+(roughly 15k tokens, teacher-forced). Math: 28 worked word and algebra
+problems, disjoint from GSM8K.
+Humanities: 24 essay-style answers spanning history, philosophy, law, and the
+arts. General: 16 mixed items, used only for super-expert protection.
+
+\paragraph{Benchmarks.} HumanEval pass@1 (164 problems, code-fence extraction,
+sandboxed subprocess execution); GSM8K exact-match on a fixed 150-problem
+subset; and a knowledge probe of 300 questions sampled from six non-STEM MMLU
+subjects (philosophy, world religions, jurisprudence, European history,
+marketing, prehistory). Baselines: 91.5\% HumanEval, 99.3\% GSM8K, 84.7\%
+MMLU-hum. At these sample sizes, differences under ${\sim}2$--3 points are
+within noise; we interpret only larger gaps.
+
+\paragraph{Ratios.} $\{25, 50, 65, 70, 75, 80, 87.5\}\%$ of routed experts
+removed. The 87.5\% point coincides with the $2k$-per-layer floor (16 kept, 8
+active).
+
+\section{Results}
+
+\subsection{Domain-restricted pruning beats the general ceiling}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrr}
+\toprule
+Experts removed & Kept/layer & HumanEval & GSM8K \\
+\midrule
+0\%    & 128 & 91.5 & 99.3 \\
+25\%   &  96 & 91.5 & 97.3 \\
+50\%   &  64 & 89.0 & 94.0 \\
+65\%   &  45 & 82.3 & 33.3 \\
+70\%   &  38 & 70.7 &  6.0 \\
+75\%   &  32 & 63.4 &  2.0 \\
+80\%   &  26 & 45.1 &  0.0 \\
+87.5\% &  16 &  0.0 &  0.0 \\
+\bottomrule
+\end{tabular}
+\caption{Coding-domain pruning sweep. In-domain (HumanEval) capability holds a
+plateau to ${\sim}65\%$ while out-of-domain (GSM8K) collapses much earlier.}
+\end{table}
+
+Coding-targeted pruning holds HumanEval within 2.5 points at 50\% removal
+---double the published general-pruning ceiling for this model \cite{mone}---and
+within 10 points at 65\%, where GSM8K has already fallen from 99.3 to 33.3. The
+in-domain curve is not smooth to the end: a plateau to the knee at
+${\sim}65\%$, steady decay through 80\%, then collapse. The 87.5\% point sits at
+the routing-slack floor and likely reflects that floor as much as the selection
+method.
+
+Routing statistics foreshadow the curve: on the general set, mean Gini of
+per-layer expert mass is 0.63, ${\sim}19/128$ experts carry 50\% of layer mass,
+and ${\sim}65/128$ carry 95\%---half the pool shares the last 5\% of routing
+mass.
+
+\subsection{Selection, not redundancy: matched random controls}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Keep policy & Kept/layer & HumanEval & GSM8K & MMLU-hum \\
+\midrule
+domain-scored (50\%)   & 64 & 89.0 & 94.0 & --- \\
+random (50\%)          & 64 & 26.8 & 40.0 & --- \\
+domain-scored (65\%)   & 45 & 82.3 & 33.3 & --- \\
+random (65\%)          & 45 &  0.6 & 16.0 & --- \\
+union code$\cup$math   & 67 & 90.9 & 97.3 & 50.3 \\
+random size-matched    & 67 & 58.5 & 37.3 & 62.3 \\
+\bottomrule
+\end{tabular}
+\caption{Random selection at matched keep-set sizes. Informed selection wins
+in-domain by 32--82 points, but \emph{loses} on the neutral domain.}
+\end{table}
+
+Random selection at matched sizes loses 62 points of HumanEval at the 50\%
+ratio and 82 points at 65\%. At 67/layer the pattern inverts on the neutral
+domain: random \emph{beats} the union on MMLU-hum (62.3 vs.\ 50.3) while
+trailing by 32--60 points in-domain. Random preserves diffuse mediocrity;
+informed selection concentrates capability into the chosen domains. (Random
+keep-sets here do not receive super-expert protection; isolating protection
+from domain scoring is left as an ablation.)
+
+\subsection{Domain specialists compose post hoc}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Variant & Kept/layer & HumanEval & GSM8K & MMLU-hum \\
+\midrule
+code-only (65\%)          &  45 & 82.3 & 33.3 & --- \\
+math-only (65\%)          &  45 &  0.0 & 93.3 & --- \\
+\textbf{code$\cup$math}   &  67 & \textbf{90.9} & \textbf{97.3} & 50.3 \\
+hum-only (65\%)           &  45 &  0.0 &  0.7 & 28.7 \\
+\textbf{code$\cup$hum}    &  71 & \textbf{84.1} & 32.7 & \textbf{74.3} \\
+baseline                  & 128 & 91.5 & 99.3 & 84.7 \\
+\bottomrule
+\end{tabular}
+\caption{Composition by per-layer set union. Unions exceed their parts
+in-domain while remaining specialists on the neutral probe.}
+\end{table}
+
+The code and math keep-sets share 22.6 experts/layer, so their union is 67
+rather than 90 (75\% of the sum of parts). The union exceeds \emph{both}
+specialists on their own domains and lands within 1--2 points of the unpruned
+model on both benchmarks at 52\% of the experts, while its 34-point deficit on
+the non-STEM probe confirms it remains a two-domain specialist rather than a
+recovered generalist. Composition is not limited to sibling domains: code and
+humanities keep-sets overlap less (19/layer), and their union still scores 84.1
+HumanEval and 74.3 MMLU-hum while GSM8K---covered by neither set---stays at
+specialist level (32.7).
+
+The specialists are strikingly disjoint in capability despite sharing half
+their experts: the math-only model solves zero HumanEval problems, while the
+code-only model retains residual GSM8K (33.3), plausibly via shared
+arithmetic-adjacent machinery.
+
+\subsection{Skills prune; knowledge does not}
+
+The same pipeline that produces strong coding (82.3) and math (93.3)
+specialists at the 65\% ratio \emph{fails} for humanities: the hum-only variant
+scores 28.7 on its own domain, barely above the 25\% multiple-choice floor.
+This is consistent with analyses finding procedural competence concentrated in
+few experts while semantic knowledge is spread across many
+\cite{whatgets,illusion}. Notably, the code$\cup$hum union recovers humanities
+to 74.3---capability neither part exhibits alone, with code-only presumably
+contributing generic instruction-following and composition machinery. Two
+implications follow: (i)~domain-restricted compression is substantially more
+effective for skill-like than knowledge-like domains at matched ratios;
+(ii)~deficits from aggressive pruning can be complementary, and unions repair
+them cheaply.
+
+We flag one confound: the humanities calibration set is essay-style while the
+probe is multiple-choice, so part of the hum-only collapse may reflect format
+sensitivity. A format-matched ablation is future work.
+
+\section{Limitations}
+
+Single model, single size, and a single seed per point; benchmark sample sizes
+give ${\pm}2$--3 point noise. HumanEval and GSM8K are older benchmarks with
+likely training contamination, so our claims rest on \emph{relative} retention
+under identical decoding rather than absolute scores. Masking realizes quality
+equivalence but not memory or latency savings, which require the mechanically
+verified surgery path. The 87.5\% point is confounded by the routing-slack
+floor. Random controls omit super-expert protection. EMO \cite{emo} achieves
+related composability via modified pretraining; we do not claim post-hoc
+selection matches purpose-trained modularity, only that useful composability
+already exists in standard checkpoints.
+
+\section{Future Work}
+
+The natural target is Kimi K3 (896 experts/layer, top-16, 2.8T parameters,
+released July 2026)---$7\times$ finer expert granularity than studied here. If
+specialization grows with granularity \cite{easyep}, the knee should move
+right, and domain-restricted compression of the strongest open model would
+yield deployable specialists in the 200--400\,GB range from a 1.56\,TB
+checkpoint. Further directions: knowledge-domain pruning with format-matched
+calibration, per-layer adaptive ratios, expert-wise distillation to recover the
+post-knee region, and $N$-way unions (``models \`a la carte'').
+
+\section*{Acknowledgments}
+
+Computations were performed using university research computing resources.
+
+\section*{Reproducibility}
+
+Code, calibration sets, pruning manifests, and raw result files are available
+at \url{https://github.com/YashSarwaiya/moeprune}.
+
+\begin{thebibliography}{99}
+\raggedright
+\bibitem{heapr} HEAPr: Hessian-based expert pruning for MoE. arXiv:2509.22299.
+\bibitem{mone} MoNE: Maximum expert pruning within 1\% accuracy loss. arXiv:2507.00390.
+\bibitem{moei2} MoE-I$^2$: Expert pruning with intra-expert decomposition. arXiv:2411.01016.
+\bibitem{moepruner} MoE-Pruner: Pruning with expert-wise knowledge distillation. arXiv:2410.12013.
+\bibitem{easyep} Domain-Specific Pruning of Large MoE Models with Few-shot Demonstrations. arXiv:2504.06792.
+\bibitem{cprune} C-PRUNE: Domain-Specific Expert Pruning for MoE LLMs. PMLR v317, 2026.
+\bibitem{halfexperts} Half the Experts, All the Code: One-Shot Domain Pruning of MoE LLMs for Coding. 2026.
+\bibitem{whatgets} What Gets Activated: Expert activation analysis in MoE LLMs. arXiv:2601.10159.
+\bibitem{illusion} The Illusion of Specialization: Super experts and polysemy in MoE. arXiv:2601.03425.
+\bibitem{doexist} Do Domain-specific Experts exist in MoE-based LLMs? arXiv:2604.05267.
+\bibitem{reap} REAP the Experts: Why Pruning Prevails for One-Shot MoE Compression. arXiv:2510.13999.
+\bibitem{hcsmoe} Retraining-Free Merging of Sparse MoE via Hierarchical Clustering. arXiv:2410.08589.
+\bibitem{emo} EMO: Pretraining Mixture of Experts for Emergent Modularity. arXiv:2605.06663.
+\bibitem{aimer} AIMER: Calibration-Free Task-Agnostic MoE Expert Pruning. arXiv:2603.18492.
+\bibitem{scoring} How to Score Experts for One-Shot MoE Expert Pruning. arXiv:2606.15716.
+\bibitem{humaneval} M. Chen et al. Evaluating Large Language Models Trained on Code. arXiv:2107.03374.
+\bibitem{gsm8k} K. Cobbe et al. Training Verifiers to Solve Math Word Problems. arXiv:2110.14168.
+\bibitem{mmlu} D. Hendrycks et al. Measuring Massive Multitask Language Understanding. arXiv:2009.03300.
+\end{thebibliography}
+
+\end{document}
